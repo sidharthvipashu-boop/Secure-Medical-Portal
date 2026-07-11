@@ -1,0 +1,181 @@
+<?php
+/**
+ * =============================================================================
+ *  seed.php  --  Populate the database with ENCRYPTED demo data (run ONCE)
+ * =============================================================================
+ *
+ *  WHY A PHP SEED SCRIPT (instead of putting the data in the .sql file)?
+ *  --------------------------------------------------------------------
+ *  Medical records are stored as AES-256 ciphertext and each carries a SHA-256
+ *  hash. Those values MUST be produced by the same PHP crypto code (and the same
+ *  key in config.php) that later decrypts them. So we generate them here, live,
+ *  guaranteeing the demo data decrypts and verifies correctly.
+ *
+ *  This script also demonstrates every security concept end-to-end:
+ *    - Idea 1: encrypt_data() on each sensitive field before INSERT.
+ *    - Idea 2: make_hash() stored with each record and each report file.
+ *    - Idea 3: store_federated_report() replicates encrypted reports to 3 sites.
+ *
+ *  Run it by visiting:  http://localhost/SecureMedicalPortal/database/seed.php
+ *  It is safe: if data already exists it will refuse to run again.
+ * =============================================================================
+ */
+
+require_once __DIR__ . '/../config/database.php';
+require_once __DIR__ . '/../includes/crypto.php';
+require_once __DIR__ . '/../includes/functions.php';
+
+header('Content-Type: text/html; charset=utf-8');
+echo '<link rel="stylesheet" href="../css/style.css"><div class="container"><div class="card">';
+echo '<h1>Database Seeder</h1>';
+
+// --- Guard: do not double-seed -------------------------------------------
+$already = (int) $pdo->query('SELECT COUNT(*) FROM medical_records')->fetchColumn();
+if ($already > 0) {
+    echo '<p class="integrity-ok">Encrypted demo data is already present ('
+       . $already . ' medical records). Nothing to do.</p>';
+    echo '<a class="btn" href="../index.php">Go to Home</a></div></div>';
+    exit;
+}
+
+/* -----------------------------------------------------------------------------
+ * 1) MEDICAL RECORDS  (Idea 1 encryption + Idea 2 hashing)
+ *
+ *    Each entry is PLAIN TEXT here. Before inserting we:
+ *      a) encrypt every sensitive field with AES-256,
+ *      b) compute one SHA-256 hash over the plain-text fields for integrity.
+ * ---------------------------------------------------------------------------*/
+$records = [
+    // [patient_id, doctor_id, diagnosis, treatment, prescription, notes]
+    [1, 1, 'Stage 1 Hypertension',
+           'Lifestyle changes; monitor blood pressure twice daily',
+           'Amlodipine 5mg once daily',
+           'Patient advised to reduce salt intake and exercise 30 min/day.'],
+    [1, 1, 'Hypertension follow-up',
+           'Blood pressure improved to 128/82; continue medication',
+           'Amlodipine 5mg once daily (continue)',
+           'Next review in 3 months. Encourage adherence.'],
+    [2, 2, 'Chronic Migraine',
+           'Trigger avoidance; keep a headache diary',
+           'Sumatriptan 50mg as needed for acute attacks',
+           'MRI ordered to rule out secondary causes.'],
+    [3, 3, 'Left knee osteoarthritis (moderate)',
+           'Physiotherapy; weight management',
+           'Ibuprofen 400mg after meals when in pain',
+           'Consider intra-articular injection if no improvement in 6 weeks.'],
+    [4, 2, 'Suspected focal epilepsy - under evaluation',
+           'EEG scheduled; avoid sleep deprivation',
+           'None until diagnosis confirmed',
+           'Family history of seizures noted. Counselled on safety.'],
+    [3, 1, 'Occasional atrial arrhythmia',
+           'Reduce caffeine; Holter monitoring for 24h',
+           'None at this stage',
+           'ECG showed intermittent irregular rhythm. Review after Holter.'],
+];
+
+$insertRecord = $pdo->prepare(
+    'INSERT INTO medical_records
+        (patient_id, doctor_id, diagnosis_enc, treatment_enc, prescription_enc, notes_enc, record_hash)
+     VALUES (:p, :d, :diag, :treat, :pres, :notes, :hash)'
+);
+
+$recordIds = [];
+foreach ($records as $r) {
+    list($pid, $did, $diag, $treat, $pres, $notes) = $r;
+
+    // Idea 2: hash the ORIGINAL plain text (order matters and must be reused on read).
+    $hash = make_hash([$diag, $treat, $pres, $notes]);
+
+    // Idea 1: encrypt each field individually before storing.
+    $insertRecord->execute([
+        ':p'     => $pid,
+        ':d'     => $did,
+        ':diag'  => encrypt_data($diag),
+        ':treat' => encrypt_data($treat),
+        ':pres'  => encrypt_data($pres),
+        ':notes' => encrypt_data($notes),
+        ':hash'  => $hash,
+    ]);
+    $recordIds[] = $pdo->lastInsertId();
+}
+echo '<p class="integrity-ok">Inserted ' . count($recordIds)
+   . ' AES-256 encrypted medical records (each with a SHA-256 integrity hash).</p>';
+
+/* -----------------------------------------------------------------------------
+ * 2) UPLOADED REPORTS  (Idea 2 file hash + Idea 3 federated replication)
+ *
+ *    We fabricate a couple of small report files (plain text stands in for a
+ *    scanned PDF), then:
+ *      a) hash the original bytes (Idea 2),
+ *      b) encrypt + copy to all three branch folders (Idea 3),
+ *      c) record metadata + per-branch storage rows.
+ * ---------------------------------------------------------------------------*/
+$reports = [
+    // [record_index, patient_id, doctor_id, original_filename, file_contents]
+    [0, 1, 1, 'blood_test_john_doe.txt',
+        "LAB REPORT\nPatient: John Doe\nTest: Lipid Panel\nCholesterol: 190 mg/dL\nBP: 128/82\nConclusion: Within acceptable range."],
+    [2, 2, 2, 'mri_scan_jane_roe.txt',
+        "RADIOLOGY REPORT\nPatient: Jane Roe\nStudy: Brain MRI\nFindings: No acute intracranial abnormality.\nImpression: Normal study."],
+];
+
+$insertReport = $pdo->prepare(
+    'INSERT INTO uploaded_reports
+        (record_id, patient_id, doctor_id, original_filename, stored_filename, file_hash)
+     VALUES (:rid, :pid, :did, :orig, :stored, :fhash)'
+);
+$insertStorage = $pdo->prepare(
+    'INSERT INTO hospital_storage (report_id, branch_name, file_path, status)
+     VALUES (:rid, :branch, :path, :status)'
+);
+
+$reportCount = 0;
+foreach ($reports as $rep) {
+    list($recIdx, $pid, $did, $orig, $contents) = $rep;
+
+    // Idea 2: fingerprint of the ORIGINAL file, verified on every download.
+    $fileHash = make_file_hash($contents);
+
+    // A unique on-disk name so files cannot be guessed or collide.
+    $stored = 'report_' . time() . '_' . $reportCount . '_' . bin2hex(random_bytes(3)) . '.enc';
+
+    // Idea 3: encrypt once and replicate the ciphertext to every branch folder.
+    $branchesWritten = store_federated_report($stored, $contents);
+
+    // Save report metadata.
+    $insertReport->execute([
+        ':rid'    => $recordIds[$recIdx] ?? null,
+        ':pid'    => $pid,
+        ':did'    => $did,
+        ':orig'   => $orig,
+        ':stored' => $stored,
+        ':fhash'  => $fileHash,
+    ]);
+    $reportId = $pdo->lastInsertId();
+
+    // Record one storage row per branch that received a copy.
+    foreach ($branchesWritten as $branchName) {
+        $folder = HOSPITAL_BRANCHES[$branchName];
+        $insertStorage->execute([
+            ':rid'    => $reportId,
+            ':branch' => $branchName,
+            ':path'   => 'uploads/' . $folder . '/' . $stored,
+            ':status' => 'stored',
+        ]);
+    }
+    $reportCount++;
+}
+echo '<p class="integrity-ok">Uploaded ' . $reportCount
+   . ' reports, each encrypted and replicated across all 3 hospital branches (A, B, C).</p>';
+
+/* -----------------------------------------------------------------------------
+ * 3) A few audit-log entries so the admin log view is not empty.
+ * ---------------------------------------------------------------------------*/
+log_event($pdo, 2, 'RECORD_CREATE', 'Dr. Smith created encrypted record for John Doe.');
+log_event($pdo, 3, 'RECORD_CREATE', 'Dr. Jones created encrypted record for Jane Roe.');
+log_event($pdo, 2, 'REPORT_UPLOAD', 'Blood test report federated across Hospital A/B/C.');
+
+echo '<p class="integrity-ok">Seeding complete. Security events logged.</p>';
+echo '<p><strong>You can now log in.</strong> Try admin / Admin@123, dr.smith / Doctor@123, or john.doe / Patient@123.</p>';
+echo '<a class="btn" href="../login.php">Go to Login</a> ';
+echo '<a class="btn btn-outline" href="../index.php">Home</a>';
+echo '</div></div>';

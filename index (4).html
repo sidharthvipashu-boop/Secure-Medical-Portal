@@ -1,0 +1,98 @@
+<?php
+/**
+ * =============================================================================
+ *  download.php  --  Securely download a report (decrypt + verify + fail-over)
+ * =============================================================================
+ *  This one file ties all three ideas together for report files:
+ *
+ *    Idea 3: read_federated_report() fetches the encrypted copy from the first
+ *            available branch (A, then B, then C) -- demonstrating resilience.
+ *    Idea 1: the ciphertext is decrypted with AES-256 back to the original file.
+ *    Idea 2: we recompute the SHA-256 of the decrypted bytes and compare it to
+ *            the stored file_hash. If they differ -> the file was tampered with:
+ *            we REFUSE the download and log an INTEGRITY_FAIL event.
+ *
+ *  ACCESS CONTROL: patients may only download their OWN reports; doctors and
+ *  admins may download any report.
+ * =============================================================================
+ */
+
+require_once __DIR__ . '/config/database.php';
+require_once __DIR__ . '/includes/auth.php';
+
+require_login();
+
+$reportId = (int) ($_GET['report_id'] ?? 0);
+
+// Fetch report metadata.
+$stmt = $pdo->prepare('SELECT * FROM uploaded_reports WHERE id = :id');
+$stmt->execute([':id' => $reportId]);
+$report = $stmt->fetch();
+
+if (!$report) {
+    http_response_code(404);
+    exit('Report not found.');
+}
+
+// ---- ACCESS CONTROL ---------------------------------------------------------
+$role = current_role();
+if ($role === 'patient') {
+    // The report must belong to THIS patient.
+    $pq = $pdo->prepare('SELECT id FROM patients WHERE user_id = :uid');
+    $pq->execute([':uid' => $_SESSION['user_id']]);
+    $myPatientId = (int) $pq->fetchColumn();
+
+    if ((int) $report['patient_id'] !== $myPatientId) {
+        http_response_code(403);
+        log_event($pdo, $_SESSION['user_id'], 'ACCESS_DENIED', "Patient tried to download report #$reportId not belonging to them.");
+        exit('Access denied: this report is not yours.');
+    }
+}
+// Doctors and admins are allowed through (hospital staff).
+
+// ---- Idea 3: read the encrypted copy from the federated branches ------------
+$plainContents = read_federated_report($report['stored_filename']);
+
+if ($plainContents === false) {
+    http_response_code(500);
+    log_event($pdo, $_SESSION['user_id'], 'REPORT_MISSING', "No branch could provide report #$reportId.");
+    exit('The report file could not be retrieved from any hospital branch.');
+}
+
+// ---- Idea 2: verify the file has not been tampered with ---------------------
+$currentHash = make_file_hash($plainContents);
+if (!hash_equals($report['file_hash'], $currentHash)) {
+    // The decrypted file does NOT match its stored fingerprint -> tampering.
+    http_response_code(409); // 409 Conflict
+    log_event($pdo, $_SESSION['user_id'], 'INTEGRITY_FAIL',
+              "Integrity violation on report file #$reportId (hash mismatch on download).");
+
+    // Show a clear, safe message instead of serving a possibly-forged file.
+    require_once __DIR__ . '/includes/header.php';
+    echo '<div class="container"><div class="integrity-bad" style="margin-top:1.5rem;">'
+       . '&#9888; Integrity Violation Detected &mdash; the report failed its SHA-256 check '
+       . 'and will NOT be downloaded. The event has been logged for the administrator.'
+       . '</div><a class="btn" href="'.BASE_URL.'index.php">Home</a></div>';
+    require_once __DIR__ . '/includes/footer.php';
+    exit;
+}
+
+// ---- All checks passed: stream the decrypted file to the browser ------------
+log_event($pdo, $_SESSION['user_id'], 'REPORT_DOWNLOAD', "Report #$reportId downloaded (integrity OK).");
+
+// Work out a reasonable content type from the original file extension.
+$ext = strtolower(pathinfo($report['original_filename'], PATHINFO_EXTENSION));
+$types = [
+    'pdf'  => 'application/pdf',
+    'jpg'  => 'image/jpeg', 'jpeg' => 'image/jpeg',
+    'png'  => 'image/png',
+    'txt'  => 'text/plain',
+];
+$contentType = $types[$ext] ?? 'application/octet-stream';
+
+// Send headers and the file body. 'attachment' prompts a download dialog.
+header('Content-Type: ' . $contentType);
+header('Content-Disposition: attachment; filename="' . basename($report['original_filename']) . '"');
+header('Content-Length: ' . strlen($plainContents));
+echo $plainContents;
+exit;

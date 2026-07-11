@@ -1,0 +1,110 @@
+<?php
+/**
+ * =============================================================================
+ *  config.php  --  Central configuration for the Secure Medical Records Portal
+ * =============================================================================
+ *
+ *  WHAT THIS FILE DOES
+ *  -------------------
+ *  This file holds every global setting the whole application depends on:
+ *    - The AES-256 encryption key and cipher settings   (Project Idea 1)
+ *    - The list of simulated hospital branches           (Project Idea 3)
+ *    - General application constants (name, base paths, upload folder, etc.)
+ *
+ *  WHY A SEPARATE CONFIG FILE?
+ *  ---------------------------
+ *  Keeping secrets and settings in ONE place (instead of scattering them across
+ *  many files) is a basic security practice. If the key ever needs to change,
+ *  you change it here once. In a real deployment this file would sit OUTSIDE the
+ *  public web root, or the key would come from an environment variable / secrets
+ *  manager. For a XAMPP student project we keep it here and explain the idea in
+ *  comments.
+ *
+ *  ---------------------------------------------------------------------------
+ *  SECURITY CONCEPT USED HERE:  SEC-PRJ-12A_25  -- Secure Storage in Edge Cloud
+ *  ---------------------------------------------------------------------------
+ *  The ENCRYPTION_KEY below is the single secret that protects all sensitive
+ *  medical data at rest. Sensitive fields (diagnosis, treatment, prescription,
+ *  notes, reports) are encrypted with AES-256 BEFORE being written to MySQL, and
+ *  only decrypted when an authorised user views them. This simulates how an edge
+ *  cloud node would keep data confidential even if the storage layer is breached.
+ * =============================================================================
+ */
+
+// Prevent the file from being requested directly in the browser.
+// (Only other PHP files should ever "include" this file.)
+if (basename($_SERVER['SCRIPT_FILENAME']) === basename(__FILE__)) {
+    http_response_code(403);
+    exit('Direct access to configuration is forbidden.');
+}
+
+/* -----------------------------------------------------------------------------
+ * 1) APPLICATION CONSTANTS
+ * ---------------------------------------------------------------------------*/
+define('APP_NAME', 'Secure Medical Records Portal');
+
+// BASE_URL: change this if you place the project in a different XAMPP folder.
+// Default assumes: http://localhost/SecureMedicalPortal/
+define('BASE_URL', '/SecureMedicalPortal/');
+
+// Absolute path to the project root on disk (used for file uploads).
+// __DIR__ is the /config folder, so we go one level up.
+define('ROOT_PATH', dirname(__DIR__));
+
+// Where uploaded medical reports are stored.
+define('UPLOAD_PATH', ROOT_PATH . '/uploads');
+
+/* -----------------------------------------------------------------------------
+ * 2) ENCRYPTION SETTINGS  (Project Idea 1 - Secure Storage in Edge Cloud)
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * ENCRYPTION_KEY
+ * --------------
+ * This is a 32-byte (256-bit) key used by AES-256. It MUST be exactly 32 bytes.
+ * In a real system this key would be generated randomly and stored securely
+ * (e.g. environment variable, hardware security module, cloud KMS). Here it is
+ * hard-coded so the project runs on XAMPP with no extra setup.
+ *
+ * NOTE: The demo/seed data was encrypted with THIS exact key. If you change the
+ * key, previously stored records can no longer be decrypted (which is exactly
+ * how real encryption behaves -- lose the key, lose the data).
+ */
+define('ENCRYPTION_KEY', 'S3cur3M3dP0rtal_AES256_Key_2025!'); // exactly 32 characters = 32 bytes = 256 bits
+
+/*
+ * ENCRYPTION_CIPHER
+ * -----------------
+ * AES-256 in CBC (Cipher Block Chaining) mode. CBC needs a random IV
+ * (Initialisation Vector) for every encryption so that encrypting the same text
+ * twice produces different ciphertext -- this hides patterns in the data.
+ */
+define('ENCRYPTION_CIPHER', 'aes-256-cbc');
+
+/* -----------------------------------------------------------------------------
+ * 3) FEDERATED STORAGE BRANCHES  (Project Idea 3 - Federated File System)
+ * ---------------------------------------------------------------------------*/
+
+/*
+ * HOSPITAL_BRANCHES
+ * -----------------
+ * We SIMULATE three geographically separate hospital sites by using three
+ * folders. When a report is uploaded, an encrypted copy is written into every
+ * branch folder. This imitates a federated / multi-site edge file system where
+ * the same encoded data is replicated across sites for availability and
+ * resilience. Each key is the branch name; each value is its folder name.
+ */
+define('HOSPITAL_BRANCHES', [
+    'Hospital A' => 'hospital_A',
+    'Hospital B' => 'hospital_B',
+    'Hospital C' => 'hospital_C',
+]);
+
+/* -----------------------------------------------------------------------------
+ * 4) SESSION START
+ * ---------------------------------------------------------------------------*/
+// Sessions let us remember who is logged in across page requests.
+// We start it here so every page that includes config.php has a session ready.
+if (session_status() === PHP_SESSION_NONE) {
+    session_start();
+}
