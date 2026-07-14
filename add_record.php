@@ -1,10 +1,9 @@
 <?php
 
-
 require_once __DIR__ . '/../config/database.php';
 require_once __DIR__ . '/../includes/auth.php';
 
-require_role('doctor'); 
+require_role('doctor');
 
 
 $dq = $pdo->prepare('SELECT id, full_name, specialization, hospital_branch FROM doctors WHERE user_id = :uid');
